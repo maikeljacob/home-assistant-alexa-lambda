@@ -30,22 +30,23 @@ _logger.setLevel(logging.DEBUG if _debug else logging.INFO)
 BASE_URL = os.environ.get('BASE_URL', '').strip("/")
 LONG_LIVED_ACCESS_TOKEN = os.environ.get('LONG_LIVED_ACCESS_TOKEN')
 VERIFY_SSL = not bool(os.environ.get('NOT_VERIFY_SSL'))
+EXCLUDED_DOMAINS = os.environ.get('EXCLUDED_DOMAINS', 'sensor,binary_sensor,device_tracker').split(',')
 
 assert BASE_URL, "BASE_URL environment variable is required"
 
 def get_ha_entities(http, token):
     """
-    Retrieve visible entities from Home Assistant.
+    Retrieve visible entities from Home Assistant with enhanced filtering.
     
-    This function queries the Home Assistant /api/states endpoint to fetch all entity states
-    and filters out those marked as hidden or disabled, respecting native HA visibility settings.
+    Queries the Home Assistant /api/states endpoint and filters entities based on visibility,
+    domain, and usability for Alexa integration.
     
     Args:
         http: urllib3.PoolManager instance for HTTP requests.
         token: Authentication token for Home Assistant API.
     
     Returns:
-        List of visible entity dictionaries or None if the request fails.
+        List of visible and usable entity dictionaries or None if the request fails.
     """
     try:
         response = http.request(
@@ -59,13 +60,17 @@ def get_ha_entities(http, token):
         )
         if response.status == 200:
             entities = json.loads(response.data.decode('utf-8'))
-            # Filter out hidden or disabled entities using native HA attributes
+            # Enhanced filtering for visible and Alexa-compatible entities
             visible_entities = [
                 entity for entity in entities
-                if not entity.get('attributes', {}).get('hidden', False)
-                and 'hidden_by' not in entity.get('attributes', {})
-                and 'disabled_by' not in entity.get('attributes', {})
+                if entity['entity_id'].split('.')[0] not in EXCLUDED_DOMAINS  # Exclude unwanted domains
+                and not entity.get('attributes', {}).get('hidden', False)     # Hidden attribute
+                and 'hidden_by' not in entity.get('attributes', {})           # Hidden by integration/user
+                and 'disabled_by' not in entity.get('attributes', {})         # Disabled entities
+                and entity.get('attributes', {}).get('friendly_name')         # Must have a friendly name
+                and entity['entity_id'].split('.')[0] in ('switch', 'light', 'lock', 'cover')  # Usable domains
             ]
+            _logger.debug("Found %d visible entities after filtering", len(visible_entities))
             return visible_entities
         else:
             _logger.error("Failed to fetch entities: %s", response.data.decode('utf-8'))
@@ -101,9 +106,14 @@ def build_discovery_response(entities, message_id):
         elif domain == 'light':
             display_category = 'LIGHT'
             interface = 'Alexa.PowerController'
+        elif domain == 'lock':
+            display_category = 'SMARTLOCK'
+            interface = 'Alexa.LockController'
+        elif domain == 'cover':
+            display_category = 'DOOR'
+            interface = 'Alexa.PowerController'  # Simplified for basic open/close
         else:
-            display_category = 'OTHER'
-            interface = 'Alexa'
+            continue  # Skip unsupported domains
 
         endpoint = {
             'endpointId': entity_id,
@@ -117,9 +127,9 @@ def build_discovery_response(entities, message_id):
                     'interface': interface,
                     'version': '3',
                     'properties': {
-                        'supported': [{'name': 'powerState'}] if interface == 'Alexa.PowerController' else [],
-                        'proactivelyReported': True,  # Enable proactive state updates (requires HA event support)
-                        'retrievable': True           # Allow Alexa to query current state
+                        'supported': [{'name': 'powerState'}] if interface == 'Alexa.PowerController' else [{'name': 'lockState'}],
+                        'proactivelyReported': True,
+                        'retrievable': True
                     }
                 }
             ]
@@ -142,11 +152,10 @@ def build_discovery_response(entities, message_id):
 
 def lambda_handler(event, context):
     """
-    Handle incoming Alexa directives with enhanced interactivity.
+    Handle incoming Alexa directives with enhanced interactivity and filtering.
     
-    This Lambda function processes Alexa directives, providing custom handling for discovery
-    requests by filtering visible entities and forwarding other directives to the Home Assistant
-    smart home endpoint.
+    Processes Alexa directives, providing custom handling for discovery requests with
+    strict entity filtering and forwarding other directives to Home Assistant.
     
     Args:
         event: The incoming Alexa directive event.
@@ -165,7 +174,6 @@ def lambda_handler(event, context):
     if header.get('payloadVersion') != '3':
         return {'event': {'payload': {'type': 'UNSUPPORTED_OPERATION', 'message': 'Only payloadVersion 3 supported'}}}
 
-    # Extract authentication token from directive
     scope = (directive.get('endpoint', {}).get('scope') or
              directive.get('payload', {}).get('grantee') or
              directive.get('payload', {}).get('scope'))
@@ -176,13 +184,11 @@ def lambda_handler(event, context):
     if not token:
         return {'event': {'payload': {'type': 'INVALID_AUTHORIZATION_CREDENTIAL', 'message': 'No token provided'}}}
 
-    # Initialize HTTP client
     http = urllib3.PoolManager(
         cert_reqs='CERT_REQUIRED' if VERIFY_SSL else 'CERT_NONE',
         timeout=urllib3.Timeout(connect=2.0, read=10.0)
     )
 
-    # Handle Alexa Discovery directive
     if header.get('namespace') == 'Alexa.Discovery' and header.get('name') == 'Discover':
         entities = get_ha_entities(http, token)
         if entities is None:
@@ -191,7 +197,6 @@ def lambda_handler(event, context):
         _logger.debug('Discovery response: %s', response)
         return response
 
-    # Forward other directives to Home Assistant smart home endpoint
     try:
         response = http.request(
             'POST',
